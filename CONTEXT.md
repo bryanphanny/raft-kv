@@ -61,41 +61,64 @@ curl -X PUT --data "bar" http://localhost:8080/kv/foo
 curl http://localhost:8080/kv/foo
 ```
 
-### Stage 2 — write-ahead log (WAL) persistence
+### Stage 2 — write-ahead log (WAL) persistence ✅ DONE (single-node mode)
 Every write appends an entry to an on-disk log *before* it's applied to the
 in-memory map. On startup, the log is replayed from the beginning to rebuild
 state. This is the same reason every real database (Postgres, SQLite,
 RocksDB) has a WAL: it's what makes a crash mid-write recoverable instead of
 silently corrupting.
 
-Example log format (one JSON line per operation, append-only file):
+Log format (one JSON line per operation, append-only file, see
+`internal/wal/wal.go`):
 ```json
 {"seq": 42, "op": "PUT", "key": "foo", "value": "bar"}
 {"seq": 43, "op": "DELETE", "key": "foo"}
 ```
 
-What changes in the code: `store.Store` gets wrapped by (or gains) a WAL
-writer that's called on every `Put`/`Delete` before the in-memory map is
-touched, plus a `Replay()` function called once at startup.
+This path is only used when `kvserver` is run without `-id` (single-node
+mode). In cluster mode (Stage 3), the replicated Raft log supersedes it —
+see Stage 3's persistence piece below.
 
-### Stage 3 — Raft consensus (the hard part — budget the most time here)
-Replicate the KV store across 3 nodes so it survives any one node crashing.
-This is where the actual distributed-systems rigor lives. Three pieces, from
-the Raft paper:
+### Stage 3 — Raft consensus ✅ DONE (leader election, log replication, persistence/crash recovery)
+Replicates the KV store across a 3-node cluster so it survives any one node
+crashing. Lives in `internal/raft/` (`raft.go` core state machine,
+`transport.go` HTTP RPC layer + handlers, `persist.go` durable state).
 
-1. **Leader election** — nodes start as followers, use randomized election
-   timeouts, become candidates and request votes if they don't hear from a
-   leader in time. Roughly the "moderate" difficulty part.
-2. **Log replication** — the leader appends client operations to its own
-   log, replicates them to followers via `AppendEntries` RPCs, and commits
-   an entry once a majority of nodes have it. This and the next two are
-   rated "hard" even in the MIT course, which gives you skeleton code and a
-   test harness — budget real time here.
-3. **Persistence & crash recovery** — a node that crashes and restarts must
-   reload its term/vote/log from disk and rejoin correctly without violating
-   safety.
+1. **Leader election** ✅ — nodes start as followers, use randomized
+   election timeouts (150-300ms), become candidates and request votes if
+   they don't hear from a leader in time. Verified: exactly one leader at
+   any time across 3 nodes, clean re-election (with a bumped term) when the
+   leader is `kill -9`'d, no flapping once settled.
+2. **Log replication** ✅ — the leader appends client operations to its own
+   log, replicates via `AppendEntries` (with the real prevLogIndex/
+   prevLogTerm consistency check + conflicting-suffix truncation, not just a
+   heartbeat), and advances `commitIndex` once a majority of nodes have an
+   entry **from the leader's own current term** (Raft paper Figure 8 — an
+   older-term entry can only commit indirectly, as a side effect of a
+   later current-term entry committing). Verified: a write committed before
+   a leader crash survives under the newly elected leader; writes continue
+   succeeding against the new leader afterward.
+3. **Persistence & crash recovery** ✅ — `currentTerm`/`votedFor`/`log` are
+   fsync'd to disk (atomic temp-file-then-rename) before a node replies to
+   any RPC that depends on the change, and reloaded on restart
+   (`raft.New`'s `storagePath` param). Verified: a killed node rejoins with
+   its prior log intact, catches up on entries it missed via the normal
+   `AppendEntries` consistency check, and a restarted ex-leader correctly
+   rejoins as a follower under the new leader's higher term with no
+   split-brain.
+   - **Known subtlety hit and fixed during this build**: a brand-new leader
+     cannot advance `commitIndex` over *any* entry — even ones a majority
+     already has durably on disk — until something from its own term
+     commits (that's the Figure-8 rule above). Without a fix, data a
+     previous leader had already told a client was "committed" would sit
+     un-applied on every node's state machine until the next real client
+     write happened to occur. Fixed the standard way: a new leader appends
+     a no-op log entry for its own term immediately upon election, which
+     commits on its own and pulls `commitIndex` forward over everything
+     before it.
 
-Core RPCs (straight from the paper, Section 5):
+Core RPCs (straight from the paper, Section 5), implemented in
+`internal/raft/transport.go`:
 ```
 RequestVote(term, candidateId, lastLogIndex, lastLogTerm)
   -> (term, voteGranted)
@@ -104,10 +127,13 @@ AppendEntries(term, leaderId, prevLogIndex, prevLogTerm, entries[], leaderCommit
   -> (term, success)
 ```
 
-**Expect real bugs here that aren't typos** — term/log mismatches, split
-votes, infinite replication loops, timer races. That's not a sign you're
-doing it wrong; multiple people who've built this exact thing reported the
-same categories of bugs. That difficulty *is* the point of this project.
+**Known gaps / deliberately out of scope so far:**
+- **Reads are not linearizable.** `GET /kv/{key}` is served from whichever
+  node you hit, reading local state — a follower can be briefly behind the
+  leader. Fixing this (lease reads or a read-index round through the
+  leader) is a real, well-known Raft extension, just not built yet.
+- **No log compaction.** `nextIndex` only ever backs up one entry at a time
+  on a mismatch (see the stretch goal below) and the log grows unbounded.
 
 ### Stretch — snapshotting
 Once the log is large, compact it into a snapshot so a lagging node can be
@@ -161,18 +187,27 @@ history. Only attempt this after Stage 3 is solid.
 ## Repo layout
 
 ```
-cmd/kvserver/       entry point (main.go)
-internal/store/     the actual KV storage (Stage 1: map; Stage 2: +WAL)
-internal/api/       HTTP handlers wrapping the store
-internal/raft/      (Stage 3, not created yet) leader election, log replication
+cmd/kvserver/       entry point (main.go) — single-node or cluster mode via -id/-peers
+internal/store/     the actual KV storage (in-memory map + RWMutex)
+internal/api/       HTTP handlers wrapping the store; writes go through Raft when configured
+internal/wal/       Stage 2 write-ahead log (single-node mode only)
+internal/raft/      Stage 3: raft.go (core state machine), transport.go (RPCs + HTTP), persist.go (durable state)
+scripts/cluster.sh  start/stop/restart/status a local 3-node demo cluster
 ```
 
 ## Current status
 
 - [x] Stage 1 — single-node KV store, HTTP API, manually verified with curl
-- [ ] Stage 2 — WAL persistence
-- [ ] Stage 3 — Raft replication across 3 nodes
-- [ ] Stretch — snapshotting
+- [x] Stage 2 — WAL persistence (single-node mode)
+- [x] Stage 3 — Raft replication across 3 nodes: leader election, log
+      replication with commit-index advancement, persistence/crash
+      recovery. All manually verified live (kill -9 the leader mid-cluster,
+      confirm re-election + no data loss + restarted node rejoins
+      correctly). Known gaps: reads aren't linearizable, no log compaction.
+- [ ] Stretch — snapshotting (not started)
+
+Run a demo cluster: `scripts/cluster.sh start`, then `curl`/kill/restart
+nodes per the instructions at the top of that script.
 
 Secondary project: `risk-analytics-platform` (Python/FastAPI, finance risk
 analytics) — kept as a shipped portfolio piece, not being actively developed
